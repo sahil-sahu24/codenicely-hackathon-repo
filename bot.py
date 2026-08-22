@@ -1063,6 +1063,27 @@ def handle_callback(api: Telegram, callback: dict) -> None:
         api.call("answerCallbackQuery", {"callback_query_id": callback["id"], "text": "Snoozed for 10 minutes"})
 
 
+def start_health_server() -> None:
+    """Railway/Render web services must listen on $PORT or the deploy is killed."""
+    raw_port = os.getenv("PORT")
+    if not raw_port:
+        return
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, format: str, *args) -> None:
+            return
+
+    server = HTTPServer(("0.0.0.0", int(raw_port)), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True, name="health-server").start()
+    print(f"Health server listening on {raw_port}", flush=True)
+
+
 def main() -> None:
     load_env_file()
     if "--setup-google-calendar" in sys.argv:
@@ -1072,6 +1093,7 @@ def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN. Copy .env.example to .env and add the token from @BotFather.")
+    start_health_server()
     initialize_database()
     api = Telegram(token)
     threading.Thread(target=reminder_scheduler, args=(api,), daemon=True, name="reminder-scheduler").start()
