@@ -98,6 +98,20 @@ def initialize_database() -> None:
         reminder_columns = {row[1] for row in db.execute("PRAGMA table_info(reminders)")}
         if "google_event_id" not in reminder_columns:
             db.execute("ALTER TABLE reminders ADD COLUMN google_event_id TEXT")
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS google_accounts (
+                chat_id INTEGER PRIMARY KEY,
+                token_json TEXT NOT NULL,
+                email TEXT,
+                connected_at_utc TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS google_oauth_pending (
+                chat_id INTEGER PRIMARY KEY,
+                state TEXT NOT NULL
+            );
+            """
+        )
 
 
 class Telegram:
@@ -168,15 +182,20 @@ def parse_reminder_with_ai(message: str, tz: ZoneInfo) -> tuple[str, datetime, O
         "Ask exactly one short clarification in the user's own language and style. "
         "If the user asks what reminders are saved, pending, upcoming, or in their list, use kind list_reminders. "
         "Never claim that you cannot access the reminder list. "
+        "This bot already uses one owner Google Calendar. If the user asks to connect, link, or disconnect a Gmail, use kind answer and say other Google accounts cannot be connected. "
         "If a normal person wants to delete, cancel, or remove a meeting/event from Google Calendar "
         "(including typos and Hinglish like hatao/hatado), use kind delete_calendar. "
         "Put the meeting name or person in title, due_local null, add_to_google_calendar false. "
         "If the message is a question or conversation rather than a reminder, use kind answer, due_local null, "
         "recurrence null, add_to_google_calendar false, and answer concisely in reply. "
-        "Set add_to_google_calendar true when a normal person wants this on Google Calendar: "
-        "they mention google/calendar (any spelling), or say schedule/add/book a meeting, meet someone, or an appointment. "
-        "In that case title should be a short event name such as 'Meeting with Harsh', not the scheduling words. "
-        "Ordinary 'remind me' messages with no calendar intent must keep add_to_google_calendar false. "
+        "Set add_to_google_calendar true whenever a normal person wants an event on Google Calendar, including messy English, Hindi, and Hinglish. "
+        "Examples that MUST be calendar events: 'schedule my google meet', 'google meet laga do', "
+        "'calendar me schedule kro', 'calander pe meeting rakhdo', 'meet schedule kar dena', "
+        "'kal 4 baje milna fix karo', 'gmeet book karo', 'appointment daal do calendar me'. "
+        "Treat google meet / gmeet / milna / mulaqat / meeting as calendar events when the user is scheduling them. "
+        "If they give a date/time but no event name, still schedule it: title 'Google Meet' when they said meet/gmeet, otherwise 'Meeting'. Do not ask for a title. "
+        "In that case title should be a short event name such as 'Meeting with Harsh' or 'Google Meet', not the scheduling words. "
+        "Ordinary 'remind me' messages with no calendar/meet/meeting intent must keep add_to_google_calendar false. "
         "For recurring reminders use only the recurrence enum supplied. weekly:0 means Monday. "
         "For a successful reminder or calendar event, set kind reminder, a concise title, and due_local as a future ISO-8601 local datetime. "
         "If the user gives a time range such as 'from 4.10 to 4.15 pm', set due_local to the start and end_local to the end. "
@@ -288,47 +307,60 @@ def google_file_path(env_name: str, default: str) -> Path:
     return configured if configured.is_absolute() else ROOT / configured
 
 
-def google_calendar_credentials(interactive: bool = False):
-    """Load/refresh Google OAuth credentials, optionally performing first login."""
+def credentials_from_token_json(token_json: str):
     try:
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
-        from google_auth_oauthlib.flow import InstalledAppFlow
     except ImportError as error:
         raise RuntimeError("Google Calendar packages are not installed. Run: python -m pip install -r requirements.txt") from error
 
-    credentials_file = google_file_path("GOOGLE_CREDENTIALS_FILE", "data/google-credentials.json")
-    token_file = google_file_path("GOOGLE_TOKEN_FILE", "data/google-token.json")
-    credentials = None
-    if token_file.exists():
-        credentials = Credentials.from_authorized_user_file(token_file, [GOOGLE_CALENDAR_SCOPE])
+    credentials = Credentials.from_authorized_user_info(json.loads(token_json), [GOOGLE_CALENDAR_SCOPE])
     if credentials and credentials.expired and credentials.refresh_token:
         credentials.refresh(Request())
     if not credentials or not credentials.valid:
-        if not interactive:
-            raise GoogleCalendarNotConnected
-        if not credentials_file.exists():
-            raise FileNotFoundError(f"Google OAuth file not found: {credentials_file}")
-        flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), [GOOGLE_CALENDAR_SCOPE])
-        credentials = flow.run_local_server(port=0)
-    token_file.parent.mkdir(exist_ok=True)
+        raise GoogleCalendarNotConnected
+    return credentials
+
+
+def owner_google_token_file() -> Path:
+    return google_file_path("GOOGLE_TOKEN_FILE", "data/google-token.json")
+
+
+def google_calendar_credentials(_chat_id: int):
+    """Always use the owner's saved Google token. Other Gmail accounts cannot be linked."""
+    token_file = owner_google_token_file()
+    if not token_file.exists():
+        raise GoogleCalendarNotConnected
+    credentials = credentials_from_token_json(token_file.read_text(encoding="utf-8"))
     token_file.write_text(credentials.to_json(), encoding="utf-8")
     return credentials
+
+
+def connected_google_email(_chat_id: int) -> Optional[str]:
+    if owner_google_token_file().exists():
+        return "Google Calendar"
+    return None
+
+
+def owner_calendar_locked_message() -> str:
+    return "This bot uses the owner's Google Calendar only. Other Gmail accounts cannot be connected."
 
 
 def google_calendar_id() -> str:
     return os.getenv("GOOGLE_CALENDAR_ID", "primary")
 
 
-def google_calendar_service():
+def google_calendar_service(chat_id: int):
     from googleapiclient.discovery import build
 
-    credentials = google_calendar_credentials(interactive=False)
+    credentials = google_calendar_credentials(chat_id)
     return build("calendar", "v3", credentials=credentials, cache_discovery=False)
 
 
-def create_google_calendar_event(title: str, start: datetime, tz: ZoneInfo, end: Optional[datetime] = None) -> tuple[str, str]:
-    """Create a timed event; return (html link, event id)."""
+def create_google_calendar_event(
+    chat_id: int, title: str, start: datetime, tz: ZoneInfo, end: Optional[datetime] = None
+) -> tuple[str, str]:
+    """Create a timed event on this user's calendar; return (html link, event id)."""
     if end is None:
         end = start + timedelta(minutes=max(1, int(os.getenv("GOOGLE_EVENT_DURATION_MINUTES", "30"))))
     event = {
@@ -337,7 +369,7 @@ def create_google_calendar_event(title: str, start: datetime, tz: ZoneInfo, end:
         "end": {"dateTime": end.isoformat(), "timeZone": tz.key},
         "description": "Created from the Telegram reminder bot.",
     }
-    created = google_calendar_service().events().insert(calendarId=google_calendar_id(), body=event).execute()
+    created = google_calendar_service(chat_id).events().insert(calendarId=google_calendar_id(), body=event).execute()
     return created.get("htmlLink", ""), created.get("id", "")
 
 
@@ -367,12 +399,12 @@ def resolve_event_end(start: datetime, text: str, tz: ZoneInfo, end_from_ai: Opt
     return start + timedelta(minutes=max(1, int(os.getenv("GOOGLE_EVENT_DURATION_MINUTES", "30"))))
 
 
-def delete_google_calendar_event(event_id: str) -> bool:
+def delete_google_calendar_event(chat_id: int, event_id: str) -> bool:
     """Delete one event by id. Missing events count as already gone."""
     if not event_id:
         return False
     try:
-        google_calendar_service().events().delete(calendarId=google_calendar_id(), eventId=event_id).execute()
+        google_calendar_service(chat_id).events().delete(calendarId=google_calendar_id(), eventId=event_id).execute()
         return True
     except GoogleCalendarNotConnected:
         raise
@@ -380,7 +412,7 @@ def delete_google_calendar_event(event_id: str) -> bool:
         return False
 
 
-def search_google_calendar_events(query: str) -> list[dict]:
+def search_google_calendar_events(chat_id: int, query: str) -> list[dict]:
     """Find upcoming events whose title matches a normal-person search phrase."""
     cleaned = re.sub(
         r"\b(?:delete|remove|cancel|hatao|hatado|from|my|google|calendar|calender|calander|meeting|meet|with|the|event|please)\b",
@@ -393,7 +425,7 @@ def search_google_calendar_events(query: str) -> list[dict]:
         return []
     now = datetime.now(timezone.utc).isoformat()
     result = (
-        google_calendar_service()
+        google_calendar_service(chat_id)
         .events()
         .list(
             calendarId=google_calendar_id(),
@@ -422,10 +454,10 @@ def html_escape(value: str) -> str:
     return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def list_upcoming_google_events() -> list[dict]:
+def list_upcoming_google_events(chat_id: int) -> list[dict]:
     now = datetime.now(timezone.utc)
     result = (
-        google_calendar_service()
+        google_calendar_service(chat_id)
         .events()
         .list(
             calendarId=google_calendar_id(),
@@ -676,8 +708,25 @@ def is_abandon_request(text: str) -> bool:
 
 
 def normalize_calendar_words(text: str) -> str:
-    normalized = re.sub(r"[^a-z0-9\s]", " ", text.lower())
-    return re.sub(r"\bcal[ae]nd[ae]rs?\b", "calendar", normalized)
+    normalized = re.sub(r"[^\w\s]", " ", text.lower(), flags=re.UNICODE)
+    hindi_map = {
+        "कैलेंडर": "calendar",
+        "कैलेंडर": "calendar",
+        "कैलेंडर": "calendar",
+        "मीटिंग": "meeting",
+        "मीट": "meet",
+        "मिलना": "meet",
+        "मुलाकात": "meet",
+        "शेड्यूल": "schedule",
+        "गूगल": "google",
+        "करो": "karo",
+        "करदो": "kardo",
+    }
+    for hindi, english in hindi_map.items():
+        normalized = normalized.replace(hindi, f" {english} ")
+    normalized = re.sub(r"\b(?:gmeet|googlemeet|google\s+meets?)\b", "google meet", normalized)
+    normalized = re.sub(r"\bcal[a-z]*d[a-z]*rs?\b", "calendar", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
 
 
 def reminder_subject(prefix: str, leftover: str = "") -> str:
@@ -730,23 +779,23 @@ def delete_calendar_items(chat_id: int, query: str) -> str:
         event_id = row["google_event_id"]
         if event_id:
             try:
-                delete_google_calendar_event(event_id)
+                delete_google_calendar_event(chat_id, event_id)
             except GoogleCalendarNotConnected:
-                return "Google Calendar is not connected yet. Complete the one-time setup with: python bot.py --setup-google-calendar"
+                return "Google Calendar is not available on this computer."
         cancel_reminder(chat_id, row["id"])
         deleted_titles.append(row["text"])
     extra_titles: list[str] = []
     try:
-        for event in search_google_calendar_events(query):
+        for event in search_google_calendar_events(chat_id, query):
             event_id = event.get("id")
             title = event.get("summary") or "event"
             if not event_id or title in deleted_titles:
                 continue
-            if delete_google_calendar_event(event_id):
+            if delete_google_calendar_event(chat_id, event_id):
                 extra_titles.append(title)
     except GoogleCalendarNotConnected:
         if not deleted_titles:
-            return "Google Calendar is not connected yet. Complete the one-time setup with: python bot.py --setup-google-calendar"
+            return "Google Calendar is not available on this computer."
     names = deleted_titles + extra_titles
     if not names:
         return "I couldn't find that meeting on Google Calendar. Try /list, then /cancel <number>."
@@ -756,36 +805,115 @@ def delete_calendar_items(chat_id: int, query: str) -> str:
     return "🗑️ Deleted from Google Calendar:\n" + "\n".join(f"• {name}" for name in unique)
 
 
+def is_connect_request(text: str) -> bool:
+    normalized = normalize_calendar_words(text)
+    tokens = set(normalized.split())
+    connect = bool(tokens & {"connect", "link", "attach", "jodo", "jod", "login", "signin"})
+    target = bool(tokens & {"google", "calendar", "gmail", "email", "account"})
+    return connect and target
+
+
+def is_disconnect_request(text: str) -> bool:
+    normalized = normalize_calendar_words(text)
+    tokens = set(normalized.split())
+    return bool(tokens & {"disconnect", "unlink", "logout"}) and bool(tokens & {"google", "calendar", "gmail"})
+
+
 def is_calendar_request(text: str) -> bool:
-    """Detect explicit requests to create a meeting or calendar event."""
+    """Detect English, Hindi, and Hinglish requests to create a calendar event."""
+    if is_calendar_list_request(text) or is_calendar_delete_request(text):
+        return False
     normalized = normalize_calendar_words(text)
     tokens = normalized.split()
-    event_word = any(token in {"meeting", "meet", "calendar", "appointment", "event"} for token in tokens)
+    event_word = any(
+        token in {
+            "meeting",
+            "meet",
+            "gmeet",
+            "calendar",
+            "appointment",
+            "event",
+            "milna",
+            "milne",
+            "mulaqat",
+            "mulakat",
+        }
+        for token in tokens
+    )
     action_word = any(
-        token in {"add", "book", "create", "schedule", "set", "put"}
+        token in {
+            "add",
+            "book",
+            "create",
+            "schedule",
+            "set",
+            "put",
+            "kro",
+            "karo",
+            "kar",
+            "kardo",
+            "karde",
+            "rakh",
+            "rakho",
+            "rakhdo",
+            "rakhde",
+            "daal",
+            "daalo",
+            "daaldo",
+            "dal",
+            "dalo",
+            "daldo",
+            "laga",
+            "lagao",
+            "lagado",
+            "bana",
+            "banao",
+            "banado",
+            "fix",
+            "fixed",
+        }
         or "schedul" in token
         or token.startswith(("sched", "shedule", "schd"))
         for token in tokens
     )
-    google_calendar = "google" in tokens and "calendar" in tokens
-    return (event_word and action_word) or google_calendar
+    google_event = "google" in tokens and any(token in {"meet", "meeting", "calendar"} for token in tokens)
+    calendar_place = any(
+        phrase in normalized
+        for phrase in ("calendar me", "calendar mein", "calendar pe", "calendar par", "calendar mai")
+    )
+    return (event_word and action_word) or google_event or (calendar_place and action_word)
 
 
 def clean_calendar_title(title: str) -> str:
     cleaned = re.sub(r"\bcal[ae]nd[ae]r\b", "calendar", title, flags=re.I)
     cleaned = re.sub(
-        r"^(?:please\s+)?(?:add|book|create|schedule|set(?:\s+up)?|shedule|schedual|schdeulde)\s+(?:an?\s+)?",
+        r"^(?:please\s+|pls\s+|plz\s+)?(?:add|book|create|schedule|set(?:\s+up)?|shedule|schedual|schdeulde)\s+(?:an?\s+|my\s+)?",
         "",
         cleaned,
         flags=re.I,
     )
-    cleaned = re.sub(r"\s+(?:on|in|to|un)\s+(?:my\s+)?google\s+calendars?\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(
+        r"\s+(?:ko\s+)?(?:schedule|schedul|shedule)?\s*(?:kro|karo|kardo|kar\s+do|kar\s+dena|rakhdo|rakh\s+do|daal\s+do|laga\s+do)\b",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(r"\s+(?:on|in|to|un|me|mein|mai|pe|par)\s+(?:my\s+)?google\s+calendars?\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(?:my\s+)?google\s+calendars?\s+(?:on|in|me|mein|mai|pe|par)?\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s+(?:on|in|me|mein|mai|pe|par)\s+(?:my\s+)?calendars?\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(?:my\s+)?calendars?\s+(?:on|in|me|mein|mai|pe|par)\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(?:my\s+)?google\s+meets?\b", "Google Meet", cleaned, flags=re.I)
     cleaned = re.sub(
         r"\s+at\s+(?:noon|midnight|\d{1,2}(?:[:.]\d{1,2})?\s*(?:a\.?m\.?|p\.?m\.?)?)\s*$",
         "",
         cleaned,
         flags=re.I,
     )
+    if re.search(r"\bgoogle meet\b", cleaned, flags=re.I) and not re.search(r"\bwith\b", cleaned, flags=re.I):
+        return "Google Meet"
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    if not cleaned or cleaned.lower() in {"calendar", "google", "this", "meeting", "meet", "event"}:
+        return "Google Meet" if re.search(r"meet", title, flags=re.I) else "Meeting"
     meet = re.search(r"\b(?:meeting\s+with|meet)\s+(.+)$", cleaned, flags=re.I)
     if meet:
         name = meet.group(1).strip(" .")
@@ -804,9 +932,11 @@ def send_agenda(api: Telegram, chat_id: int, user_text: str = "", mode: str = "b
     blocks: list[str] = []
     if mode in {"both", "calendar"}:
         try:
-            events = list_upcoming_google_events()
+            events = list_upcoming_google_events(chat_id)
             if events:
-                lines = ["📅 <b>Google Calendar</b>"]
+                email = html_escape(connected_google_email(chat_id) or "")
+                heading = f"📅 <b>Google Calendar</b>" + (f"\n<i>{email}</i>" if email else "")
+                lines = [heading]
                 for event in events:
                     title = html_escape(event.get("summary") or "Untitled")
                     start = event.get("start") or {}
@@ -821,7 +951,7 @@ def send_agenda(api: Telegram, chat_id: int, user_text: str = "", mode: str = "b
             else:
                 blocks.append("📅 <b>Google Calendar</b>\n<i>No upcoming events.</i>" if not hinglish else "📅 <b>Google Calendar</b>\n<i>Koi upcoming event nahi hai.</i>")
         except GoogleCalendarNotConnected:
-            blocks.append("📅 <b>Google Calendar</b>\n<i>Not connected. Run: python bot.py --setup-google-calendar</i>")
+            blocks.append("📅 <b>Google Calendar</b>\n<i>Owner calendar is not available on this computer.</i>")
         except Exception as error:
             blocks.append(f"📅 <b>Google Calendar</b>\n<i>Couldn’t load events: {html_escape(str(error))}</i>")
     if mode in {"both", "reminders"}:
@@ -851,7 +981,7 @@ def cancel_reminder(chat_id: int, reminder_id: int) -> bool:
         event_id = row["google_event_id"] if row else None
         if event_id:
             try:
-                delete_google_calendar_event(event_id)
+                delete_google_calendar_event(chat_id, event_id)
             except GoogleCalendarNotConnected:
                 pass
     return cancelled
@@ -936,10 +1066,30 @@ def handle_message(api: Telegram, message: dict) -> None:
         return
     command = text.split()[0].split("@")[0].lower()
     if command == "/start":
-        api.send(chat_id, "👋 I remember things for you.\n\nTry: ‘remind me to call Mom tomorrow at 6pm’\nOr: ‘drink water in 20 minutes’\n\nCommands: /list, /cancel <number>, /timezone <IANA timezone>, /help")
+        api.send(
+            chat_id,
+            "👋 I remember things for you.\n\n"
+            "Meetings go on the owner's Google Calendar.\n\n"
+            "Try: ‘remind me to call Mom tomorrow at 6pm’\n"
+            "Or: ‘schedule a meet with Priyanshu at 4pm today’\n\n"
+            "Commands: /list, /cancel <number>, /timezone, /help",
+        )
         return
     if command == "/help":
-        api.send(chat_id, "Examples:\n• remind me to submit the form tomorrow at 5pm\n• drink water in 20 minutes\n• standup every weekday at 9:30am\n• pay rent every month at 10am\n\n/list — show reminders\n/cancel 3 — cancel reminder #3\n/timezone Asia/Kolkata — change your timezone")
+        api.send(
+            chat_id,
+            "Examples:\n"
+            "• schedule a meeting with Harsh at 6pm today\n"
+            "• remind me to submit the form tomorrow at 5pm\n"
+            "• what’s in my google calendar\n"
+            "• delete meeting with Harsh from calendar\n\n"
+            "/list — reminders + the owner's Google Calendar\n"
+            "/cancel 3 — cancel reminder #3\n"
+            "/timezone Asia/Kolkata",
+        )
+        return
+    if command in {"/connect", "/disconnect"}:
+        api.send(chat_id, owner_calendar_locked_message())
         return
     if command == "/timezone":
         parts = text.split(maxsplit=1)
@@ -962,6 +1112,9 @@ def handle_message(api: Telegram, message: dict) -> None:
             api.send(chat_id, "Use /cancel <number>. Find numbers with /list.")
             return
         api.send(chat_id, "✅ Reminder cancelled." if cancel_reminder(chat_id, int(parts[1])) else "I couldn't find that active reminder.")
+        return
+    if is_connect_request(text) or is_disconnect_request(text):
+        api.send(chat_id, owner_calendar_locked_message())
         return
     if pending_clarification(chat_id) and is_abandon_request(text):
         clear_pending_clarification(chat_id)
@@ -1009,20 +1162,23 @@ def handle_message(api: Telegram, message: dict) -> None:
         calendar_link = ""
         google_event_id = None
         end = resolve_event_end(due, combined_text, tz, end)
+        calendar_email = connected_google_email(chat_id)
         if calendar_requested:
             try:
-                calendar_link, google_event_id = create_google_calendar_event(task, due, tz, end)
+                calendar_link, google_event_id = create_google_calendar_event(chat_id, task, due, tz, end)
             except GoogleCalendarNotConnected:
-                raise BotReply(
-                    "Google Calendar is not connected yet. Complete the one-time setup with: "
-                    "python bot.py --setup-google-calendar"
-                )
+                raise BotReply("Google Calendar is not available on this computer.")
             except Exception as error:
                 raise BotReply(f"I couldn't add that meeting to Google Calendar: {error}")
         add_reminder(chat_id, task, due, recurrence, google_event_id)
         clear_pending_clarification(chat_id)
         confirmation = f"✅ I’ll remind you to {task} on {format_local(due.astimezone(timezone.utc).isoformat(), tz)}."
-        if calendar_requested:
+        if google_event_id:
+            who = calendar_email or "Google Calendar"
+            confirmation += f"\n📅 Also added to {who} ({format_list_time(due, tz)} – {format_list_time(end, tz)})."
+            if calendar_link:
+                confirmation += f"\n{calendar_link}"
+        elif calendar_requested:
             confirmation = (
                 f"✅ {task} added to Google Calendar for {format_list_time(due, tz)} – {format_list_time(end, tz)}."
             )
@@ -1041,6 +1197,8 @@ def handle_message(api: Telegram, message: dict) -> None:
         elif action.action == "delete_calendar":
             clear_pending_clarification(chat_id)
             api.send(chat_id, delete_calendar_items(chat_id, action.query or text))
+        elif action.action in {"connect_calendar", "disconnect_calendar"}:
+            api.send(chat_id, owner_calendar_locked_message())
     except ValueError as error:
         api.send(chat_id, f"I couldn't set that reminder: {error}")
 
@@ -1088,8 +1246,7 @@ def main() -> None:
     load_env_file()
     start_health_server()
     if "--setup-google-calendar" in sys.argv:
-        google_calendar_credentials(interactive=True)
-        print("Google Calendar connected successfully.")
+        print("This bot uses data/google-token.json only. Other Gmail accounts cannot be connected in chat.")
         return
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     print(

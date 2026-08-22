@@ -51,18 +51,8 @@ Keep the terminal open while demonstrating; the bot must stay running to deliver
 
 The bot asks the LLM for JSON, then validates the title, date/time, and recurrence rule locally before saving anything. The original lightweight parser remains as a fallback if no OpenRouter key is configured.
 
-## Connect Google Calendar once
+## Google Calendar
 
-1. Enable Google Calendar API in Google Cloud.
-2. Create a Desktop app OAuth client and download its JSON.
-3. Save it as `data/google-credentials.json`.
-4. Install dependencies and authorize:
+The bot uses only the owner login in `data/google-token.json`. There is no in-chat `/connect` for other Gmail accounts.
 
-   ```powershell
-   python -m pip install -r requirements.txt
-   python bot.py --setup-google-calendar
-   ```
-
-5. Sign in with the Gmail whose primary calendar should receive events.
-
-After that, messages such as `schedule a meeting with Rahul tomorrow at 4 PM` create a 30-minute Google Calendar event and a Telegram reminder. Ordinary reminder messages do not create calendar events.
+Meetings such as `schedule a meeting with Rahul tomorrow at 4 PM` go on that calendar. Ordinary reminder messages do not create calendar events.
