@@ -1086,14 +1086,18 @@ def start_health_server() -> None:
 
 def main() -> None:
     load_env_file()
+    start_health_server()
     if "--setup-google-calendar" in sys.argv:
         google_calendar_credentials(interactive=True)
         print("Google Calendar connected successfully.")
         return
     token = os.getenv("TELEGRAM_BOT_TOKEN")
+    print(
+        f"Startup: PORT={os.getenv('PORT') or 'none'} token={'set' if token else 'MISSING'}",
+        flush=True,
+    )
     if not token:
-        raise SystemExit("Missing TELEGRAM_BOT_TOKEN. Copy .env.example to .env and add the token from @BotFather.")
-    start_health_server()
+        raise SystemExit("Missing TELEGRAM_BOT_TOKEN. Add it in Railway Variables and redeploy.")
     initialize_database()
     api = Telegram(token)
     threading.Thread(target=reminder_scheduler, args=(api,), daemon=True, name="reminder-scheduler").start()
