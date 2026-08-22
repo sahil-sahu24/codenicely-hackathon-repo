@@ -53,6 +53,6 @@ The bot asks the LLM for JSON, then validates the title, date/time, and recurren
 
 ## Google Calendar
 
-The bot uses only the owner login in `data/google-token.json`. There is no in-chat `/connect` for other Gmail accounts.
+The bot uses only the owner login from `GOOGLE_TOKEN_JSON` or `data/google-token.json`. There is no in-chat `/connect` for other Gmail accounts. On Railway, set the `GOOGLE_TOKEN_JSON` variable to that JSON.
 
 Meetings such as `schedule a meeting with Rahul tomorrow at 4 PM` go on that calendar. Ordinary reminder messages do not create calendar events.

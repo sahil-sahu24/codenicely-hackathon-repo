@@ -326,18 +326,30 @@ def owner_google_token_file() -> Path:
     return google_file_path("GOOGLE_TOKEN_FILE", "data/google-token.json")
 
 
+def owner_google_token_json() -> str:
+    raw = (os.getenv("GOOGLE_TOKEN_JSON") or "").strip().strip("'").strip('"')
+    if raw:
+        return raw
+    token_file = owner_google_token_file()
+    if token_file.exists():
+        return token_file.read_text(encoding="utf-8")
+    raise GoogleCalendarNotConnected
+
+
 def google_calendar_credentials(_chat_id: int):
     """Always use the owner's saved Google token. Other Gmail accounts cannot be linked."""
+    credentials = credentials_from_token_json(owner_google_token_json())
     token_file = owner_google_token_file()
-    if not token_file.exists():
-        raise GoogleCalendarNotConnected
-    credentials = credentials_from_token_json(token_file.read_text(encoding="utf-8"))
-    token_file.write_text(credentials.to_json(), encoding="utf-8")
+    try:
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        token_file.write_text(credentials.to_json(), encoding="utf-8")
+    except OSError:
+        pass
     return credentials
 
 
 def connected_google_email(_chat_id: int) -> Optional[str]:
-    if owner_google_token_file().exists():
+    if (os.getenv("GOOGLE_TOKEN_JSON") or "").strip() or owner_google_token_file().exists():
         return "Google Calendar"
     return None
 
@@ -781,7 +793,7 @@ def delete_calendar_items(chat_id: int, query: str) -> str:
             try:
                 delete_google_calendar_event(chat_id, event_id)
             except GoogleCalendarNotConnected:
-                return "Google Calendar is not available on this computer."
+                return "Google Calendar is not available right now."
         cancel_reminder(chat_id, row["id"])
         deleted_titles.append(row["text"])
     extra_titles: list[str] = []
@@ -795,7 +807,7 @@ def delete_calendar_items(chat_id: int, query: str) -> str:
                 extra_titles.append(title)
     except GoogleCalendarNotConnected:
         if not deleted_titles:
-            return "Google Calendar is not available on this computer."
+            return "Google Calendar is not available right now."
     names = deleted_titles + extra_titles
     if not names:
         return "I couldn't find that meeting on Google Calendar. Try /list, then /cancel <number>."
@@ -951,7 +963,7 @@ def send_agenda(api: Telegram, chat_id: int, user_text: str = "", mode: str = "b
             else:
                 blocks.append("📅 <b>Google Calendar</b>\n<i>No upcoming events.</i>" if not hinglish else "📅 <b>Google Calendar</b>\n<i>Koi upcoming event nahi hai.</i>")
         except GoogleCalendarNotConnected:
-            blocks.append("📅 <b>Google Calendar</b>\n<i>Owner calendar is not available on this computer.</i>")
+            blocks.append("📅 <b>Google Calendar</b>\n<i>Owner calendar is not available right now.</i>")
         except Exception as error:
             blocks.append(f"📅 <b>Google Calendar</b>\n<i>Couldn’t load events: {html_escape(str(error))}</i>")
     if mode in {"both", "reminders"}:
@@ -1167,7 +1179,7 @@ def handle_message(api: Telegram, message: dict) -> None:
             try:
                 calendar_link, google_event_id = create_google_calendar_event(chat_id, task, due, tz, end)
             except GoogleCalendarNotConnected:
-                raise BotReply("Google Calendar is not available on this computer.")
+                raise BotReply("Google Calendar is not available right now.")
             except Exception as error:
                 raise BotReply(f"I couldn't add that meeting to Google Calendar: {error}")
         add_reminder(chat_id, task, due, recurrence, google_event_id)
@@ -1246,7 +1258,7 @@ def main() -> None:
     load_env_file()
     start_health_server()
     if "--setup-google-calendar" in sys.argv:
-        print("This bot uses data/google-token.json only. Other Gmail accounts cannot be connected in chat.")
+        print("This bot uses GOOGLE_TOKEN_JSON or data/google-token.json. Other Gmail accounts cannot be connected in chat.")
         return
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     print(
