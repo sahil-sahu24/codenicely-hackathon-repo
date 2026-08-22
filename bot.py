@@ -194,6 +194,8 @@ def parse_reminder_with_ai(message: str, tz: ZoneInfo) -> tuple[str, datetime, O
         "'kal 4 baje milna fix karo', 'gmeet book karo', 'appointment daal do calendar me'. "
         "Treat google meet / gmeet / milna / mulaqat / meeting as calendar events when the user is scheduling them. "
         "If they give a date/time but no event name, still schedule it: title 'Google Meet' when they said meet/gmeet, otherwise 'Meeting'. Do not ask for a title. "
+        "Phrases like 'schedule in my google calendar', 'calendar me schedule kro', and 'google calendar pe laga do' are complete calendar create requests. "
+        "This bot inserts the event itself. Never tell the user to open or click a calendar link to finish scheduling. "
         "In that case title should be a short event name such as 'Meeting with Harsh' or 'Google Meet', not the scheduling words. "
         "Ordinary 'remind me' messages with no calendar/meet/meeting intent must keep add_to_google_calendar false. "
         "For recurring reminders use only the recurrence enum supplied. weekly:0 means Monday. "
@@ -1171,13 +1173,11 @@ def handle_message(api: Telegram, message: dict) -> None:
             task = clean_calendar_title(task)
             if task.lower() in {"in my google calendar", "on my google calendar", "this"}:
                 task = clean_calendar_title(combined_text)
-        calendar_link = ""
         google_event_id = None
         end = resolve_event_end(due, combined_text, tz, end)
-        calendar_email = connected_google_email(chat_id)
         if calendar_requested:
             try:
-                calendar_link, google_event_id = create_google_calendar_event(chat_id, task, due, tz, end)
+                _, google_event_id = create_google_calendar_event(chat_id, task, due, tz, end)
             except GoogleCalendarNotConnected:
                 raise BotReply("Google Calendar is not available right now.")
             except Exception as error:
@@ -1186,16 +1186,15 @@ def handle_message(api: Telegram, message: dict) -> None:
         clear_pending_clarification(chat_id)
         confirmation = f"✅ I’ll remind you to {task} on {format_local(due.astimezone(timezone.utc).isoformat(), tz)}."
         if google_event_id:
-            who = calendar_email or "Google Calendar"
-            confirmation += f"\n📅 Also added to {who} ({format_list_time(due, tz)} – {format_list_time(end, tz)})."
-            if calendar_link:
-                confirmation += f"\n{calendar_link}"
+            confirmation = (
+                f"✅ Already added to Google Calendar: {task}\n"
+                f"{format_list_time(due, tz)} – {format_list_time(end, tz)}\n"
+                "No link to click — it is on the calendar now."
+            )
         elif calendar_requested:
             confirmation = (
-                f"✅ {task} added to Google Calendar for {format_list_time(due, tz)} – {format_list_time(end, tz)}."
+                f"✅ {task} is set for {format_list_time(due, tz)} – {format_list_time(end, tz)}."
             )
-            if calendar_link:
-                confirmation += f"\n{calendar_link}"
         api.send(chat_id, confirmation)
     except BotReply as reply:
         if reply.needs_clarification:
